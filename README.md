@@ -1,8 +1,9 @@
-﻿# Eventlog to Json
+﻿# WET
 
-This is another fork of the https://github.com/zensquare/evtsys.
+**Windows Eventlog Transport** is small service for transporting Window's log Event to the Vector collector in JSON format.
 
-This project implements a lightweight Windows event sender for the Vector collector.
+This is another fork of the https://github.com/zensquare/evtsys
+The page of project here: https://www.zensquare.com/projects/EvtSys
 
 Original source is located at https://code.google.com/archive/p/eventlog-to-syslog/
 
