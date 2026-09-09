@@ -93,7 +93,7 @@
 */
 
 /* Maximum size of a message */
-#define SYSLOG_DEF_SZ		1024
+#define SYSLOG_DEF_SZ		16384
 
 /* Masks */
 #define SYSLOG_PRI(x)		((x) & 0x07)

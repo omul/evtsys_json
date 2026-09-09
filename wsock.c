@@ -231,12 +231,31 @@ void WSockClose()
 int WSockSend(char * message)
 {
 	int len;
-	int done = 0;
+	int sent;
+	int total;
+	char* wire_message;
     int i;
     int count = COUNT_OF(SyslogSockets);
 
     /* Get message length */
 	len = (int) strlen(message);
+	if (len <= 0) 
+		return 0;
+
+	/* TCP is a byte stream, so terminate each JSON document with LF. */
+	if (SyslogEnableTcp) {
+		wire_message = (char*)malloc((size_t)len + 2);
+		if (wire_message == NULL)
+			return 1;
+		memcpy(wire_message, message, (size_t)len);
+		wire_message[len] = '\n';
+		wire_message[len + 1] = '\0';
+		total = len + 1;
+	}
+	else {
+		wire_message = message;
+		total = len;
+	}
 
 	for (i = 0; i < count; i++)
 	{
@@ -245,15 +264,28 @@ int WSockSend(char * message)
             if (SyslogSockets[i].Connected == FALSE)
                 ReconnectSocket(i);
 
-            if(SyslogSockets[i].Connected && send(SyslogSockets[i].Socket, message, len, 0) != len) {
-			    if (h_errno != WSAEHOSTUNREACH && h_errno != WSAENETUNREACH) {
-                    // Log the error, but continue operation if possible //
-                    Log(LOG_ERROR|LOG_SYS, "Cannot send message through socket for %s", SyslogSockets[i].Name);
-                    SyslogSockets[i].Connected = FALSE;
-			    }
-		    }
-	    }
+			if (SyslogSockets[i].Connected) {
+				int offset = 0;
+				while (offset < total) {
+					sent = send(SyslogSockets[i].Socket, wire_message + offset, total - offset, 0);
+					if (sent == SOCKET_ERROR || sent == 0)
+						break;
+					offset += sent;
+				}
+
+				if (offset != total) {
+					if (h_errno != WSAEHOSTUNREACH && h_errno != WSAENETUNREACH) {
+						// Log the error, but continue operation if possible //
+						Log(LOG_ERROR | LOG_SYS, "Cannot send message through socket for %s", SyslogSockets[i].Name);
+						SyslogSockets[i].Connected = FALSE;
+					}
+				}
+			}
+		}
 	}
+
+	if (SyslogEnableTcp)
+		free(wire_message);
 
 	/* Success */
 	return 0;

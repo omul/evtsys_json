@@ -1,0 +1,486 @@
+diff --git a/syslog.h b/syslog.h
+index 0000000..1111111 100644
+--- a/syslog.h
++++ b/syslog.h
+@@ -86,7 +86,7 @@
+  */
+ /* Maximum size of a message */
+-#define SYSLOG_DEF_SZ		1024
++#define SYSLOG_DEF_SZ		16384
+
+ /* Masks */
+ #define SYSLOG_PRI(x)		((x) & 0x07)
+diff --git a/winevent.c b/winevent.c
+index 0000000..1111111 100644
+--- a/winevent.c
++++ b/winevent.c
+@@ -36,6 +36,7 @@
+ #include "main.h"
+ #include <malloc.h>
++ #include <wchar.h>
+ #include <winevt.h>
+ #include <winmeta.h>
+@@ -175,6 +176,257 @@ void WinEventCancelSubscribes()
+ 	}
+ }
+
++/*
++ * JSON support
++ *
++ * The Windows Event Log API can render an event as XML.  EventData is
++ * intentionally parsed dynamically here, so the program does not need to
++ * know the fields of every possible Windows event (4624, 4625, 4688, 4720,
++ * etc.) in advance.
++ */
++static boolean JsonAppend(WCHAR **buffer, size_t *length, size_t *capacity,
++						  const WCHAR *text)
++{
++	size_t add;
++	WCHAR *newBuffer;
++	size_t newCapacity;
++
++	if (text == NULL)
++		return TRUE;
++
++	add = wcslen(text);
++	if (*length + add + 1 > *capacity) {
++		newCapacity = (*capacity == 0) ? 1024 : *capacity;
++		while (*length + add + 1 > newCapacity)
++			newCapacity *= 2;
++
++		newBuffer = (WCHAR *)realloc(*buffer, newCapacity * sizeof(WCHAR));
++		if (newBuffer == NULL)
++			return FALSE;
++
++		*buffer = newBuffer;
++		*capacity = newCapacity;
++	}
++
++	memcpy(*buffer + *length, text, add * sizeof(WCHAR));
++	*length += add;
++	(*buffer)[*length] = L'\0';
++	return TRUE;
++}
++
++static boolean JsonAppendChar(WCHAR **buffer, size_t *length,
++							   size_t *capacity, WCHAR ch)
++{
++	WCHAR tmp[2];
++	tmp[0] = ch;
++	tmp[1] = L'\0';
++	return JsonAppend(buffer, length, capacity, tmp);
++}
++
++/*
++ * Append an XML text value as a JSON string value.
++ * XML entities commonly occurring in EventData are decoded while escaping
++ * characters which have a special meaning in JSON.
++ */
++static boolean JsonAppendEscapedXml(WCHAR **buffer, size_t *length,
++									 size_t *capacity, const WCHAR *text)
++{
++	const WCHAR *p;
++	const WCHAR *semi;
++	WCHAR entity[16];
++	unsigned long value;
++	WCHAR ch;
++
++	if (!JsonAppendChar(buffer, length, capacity, L'"'))
++		return FALSE;
++
++	if (text != NULL) {
++		for (p = text; *p != L'\0'; ++p) {
++			ch = *p;
++
++			if (ch == L'&') {
++				semi = wcschr(p, L';');
++				if (semi != NULL && (size_t)(semi - p) < COUNT_OF(entity)) {
++					size_t n = (size_t)(semi - p - 1);
++					wcsncpy_s(entity, COUNT_OF(entity), p + 1, n);
++					entity[n] = L'\0';
++
++					if (_wcsicmp(entity, L"quot") == 0) {
++						if (!JsonAppend(buffer, length, capacity, L"\\\""))
++							return FALSE;
++						p = semi;
++						continue;
++					}
++					if (_wcsicmp(entity, L"amp") == 0) {
++						if (!JsonAppend(buffer, length, capacity, L"&"))
++							return FALSE;
++						p = semi;
++						continue;
++					}
++					if (_wcsicmp(entity, L"lt") == 0) {
++						if (!JsonAppend(buffer, length, capacity, L"<"))
++							return FALSE;
++						p = semi;
++						continue;
++					}
++					if (_wcsicmp(entity, L"gt") == 0) {
++						if (!JsonAppend(buffer, length, capacity, L">"))
++							return FALSE;
++						p = semi;
++						continue;
++					}
++					if (_wcsicmp(entity, L"apos") == 0) {
++						if (!JsonAppend(buffer, length, capacity, L"'"))
++							return FALSE;
++						p = semi;
++						continue;
++					}
++
++					if (entity[0] == L'#') {
++						value = 0;
++						if (entity[1] == L'x' || entity[1] == L'X')
++							value = wcstoul(entity + 2, NULL, 16);
++						else
++							value = wcstoul(entity + 1, NULL, 10);
++
++						if (value != 0 && value <= 0xFFFF) {
++							ch = (WCHAR)value;
++							p = semi;
++						}
++					}
++				}
++			}
++
++			switch (ch) {
++			case L'\\':
++				if (!JsonAppend(buffer, length, capacity, L"\\\\"))
++					return FALSE;
++				break;
++			case L'"':
++				if (!JsonAppend(buffer, length, capacity, L"\\\""))
++					return FALSE;
++				break;
++			case L'\b':
++				if (!JsonAppend(buffer, length, capacity, L"\\b"))
++					return FALSE;
++				break;
++			case L'\f':
++				if (!JsonAppend(buffer, length, capacity, L"\\f"))
++					return FALSE;
++				break;
++			case L'\n':
++				if (!JsonAppend(buffer, length, capacity, L"\\n"))
++					return FALSE;
++				break;
++			case L'\r':
++				if (!JsonAppend(buffer, length, capacity, L"\\r"))
++					return FALSE;
++				break;
++			case L'\t':
++				if (!JsonAppend(buffer, length, capacity, L"\\t"))
++					return FALSE;
++				break;
++			default:
++				if (ch < 0x20) {
++					WCHAR escaped[7];
++					_snwprintf_s(escaped, COUNT_OF(escaped), _TRUNCATE,
++						L"\\u%04x", (unsigned int)ch);
++					if (!JsonAppend(buffer, length, capacity, escaped))
++						return FALSE;
++				} else if (!JsonAppendChar(buffer, length, capacity, ch)) {
++					return FALSE;
++				}
++				break;
++			}
++		}
++	}
++
++	return JsonAppendChar(buffer, length, capacity, L'"');
++}
++
++static boolean JsonAppendUInt64(WCHAR **buffer, size_t *length,
++								size_t *capacity, ULONGLONG value)
++{
++	WCHAR tmp[32];
++	_snwprintf_s(tmp, COUNT_OF(tmp), _TRUNCATE, L"%llu",
++				 (unsigned long long)value);
++	return JsonAppend(buffer, length, capacity, tmp);
++}
++
++static boolean JsonAppendInt(WCHAR **buffer, size_t *length,
++							 size_t *capacity, int value)
++{
++	WCHAR tmp[32];
++	_snwprintf_s(tmp, COUNT_OF(tmp), _TRUNCATE, L"%d", value);
++	return JsonAppend(buffer, length, capacity, tmp);
++}
++
++/*
++ * Extract <EventData><Data Name="...">value</Data>...</EventData>
++ * from the event XML.  Fields without a Name attribute are exported as
++ * Data0, Data1, ... .  UserData is deliberately left untouched for now.
++ */
++static boolean JsonAppendEventData(WCHAR **buffer, size_t *length,
++									size_t *capacity, const WCHAR *xml)
++{
++	const WCHAR *section;
++	const WCHAR *sectionEnd;
++	const WCHAR *p;
++	const WCHAR *tagEnd;
++	const WCHAR *valueEnd;
++	const WCHAR *nameStart;
++	const WCHAR *nameEnd;
++	WCHAR *name = NULL;
++	WCHAR *value = NULL;
++	size_t valueLen;
++	size_t nameLen;
++	int unnamed = 0;
++	boolean first = TRUE;
++	boolean ok = TRUE;
++
++	section = wcsstr(xml, L"<EventData");
++	if (section == NULL)
++		return JsonAppend(buffer, length, capacity, L"");
++
++	tagEnd = wcschr(section, L'>');
++	if (tagEnd == NULL)
++		return TRUE;
++
++	sectionEnd = wcsstr(tagEnd + 1, L"</EventData>");
++	if (sectionEnd == NULL)
++		return TRUE;
++
++	p = tagEnd + 1;
++	while (p < sectionEnd) {
++		p = wcsstr(p, L"<Data");
++		if (p == NULL || p >= sectionEnd)
++			break;
++
++		tagEnd = wcschr(p, L'>');
++		if (tagEnd == NULL || tagEnd >= sectionEnd)
++			break;
++
++		name = NULL;
++		nameStart = wcsstr(p, L"Name=");
++		if (nameStart != NULL && nameStart < tagEnd) {
++			nameStart += 5;
++			if (*nameStart == L'"' || *nameStart == L'\'') {
++				WCHAR quote = *nameStart++;
++				nameEnd = wcschr(nameStart, quote);
++				if (nameEnd != NULL && nameEnd < tagEnd) {
++					nameLen = (size_t)(nameEnd - nameStart);
++					name = (WCHAR *)malloc((nameLen + 1) * sizeof(WCHAR));
++					if (name == NULL) {
++						ok = FALSE;
++						break;
++					}
++					wcsncpy_s(name, nameLen + 1, nameStart, nameLen);
++					name[nameLen] = L'\0';
++				}
++			}
++		}
++
++		valueEnd = wcsstr(tagEnd + 1, L"</Data>");
++		if (valueEnd == NULL || valueEnd > sectionEnd) {
++			if (name) free(name);
++			break;
++		}
++
++		valueLen = (size_t)(valueEnd - (tagEnd + 1));
++		value = (WCHAR *)malloc((valueLen + 1) * sizeof(WCHAR));
++		if (value == NULL) {
++			if (name) free(name);
++			ok = FALSE;
++			break;
++		}
++		wcsncpy_s(value, valueLen + 1, tagEnd + 1, valueLen);
++		value[valueLen] = L'\0';
++
++		if (!first && !JsonAppend(buffer, length, capacity, L",")) {
++			ok = FALSE;
++			free(value);
++			if (name) free(name);
++			break;
++		}
++		first = FALSE;
++
++		if (name == NULL) {
++			WCHAR generated[32];
++			_snwprintf_s(generated, COUNT_OF(generated), _TRUNCATE,
++				L"Data%d", unnamed++);
++			if (!JsonAppendEscapedXml(buffer, length, capacity, generated))
++				ok = FALSE;
++		} else {
++			if (!JsonAppendEscapedXml(buffer, length, capacity, name))
++				ok = FALSE;
++		}
++
++		if (ok && !JsonAppend(buffer, length, capacity, L":"))
++			ok = FALSE;
++		if (ok && !JsonAppendEscapedXml(buffer, length, capacity, value))
++			ok = FALSE;
++
++		free(value);
++		if (name) free(name);
++		if (!ok)
++			break;
++
++		p = valueEnd + wcslen(L"</Data>");
++	}
++
++	return ok;
++}
++
++static WCHAR *WinEventTimeToISO8601(ULONGLONG ulongTime)
++{
++	static WCHAR result[64];
++	SYSTEMTIME sysTime;
++	FILETIME fTime;
++	ULARGE_INTEGER ulargeTime;
++
++	ulargeTime.QuadPart = ulongTime;
++	fTime.dwLowDateTime = ulargeTime.LowPart;
++	fTime.dwHighDateTime = ulargeTime.HighPart;
++
++	if (!FileTimeToSystemTime(&fTime, &sysTime)) {
++		Log(LOG_ERROR|LOG_SYS, "Error formatting event time to ISO-8601");
++		return NULL;
++	}
++
++	_snwprintf_s(result, COUNT_OF(result), _TRUNCATE,
++		L"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
++		sysTime.wYear, sysTime.wMonth, sysTime.wDay,
++		sysTime.wHour, sysTime.wMinute, sysTime.wSecond,
++		sysTime.wMilliseconds);
++
++	return result;
++}
++
++static WCHAR *BuildEventJson(EVT_HANDLE hEvent, PEVT_VARIANT eventInfo,
++							 const WCHAR *provider)
++{
++	WCHAR *json = NULL;
++	size_t length = 0;
++	size_t capacity = 0;
++	WCHAR *timestamp = NULL;
++	WCHAR *channel = NULL;
++	WCHAR *computer = NULL;
++	WCHAR *xml = NULL;
++	DWORD bufferSize = 0;
++	DWORD bufferUsed = 0;
++	WCHAR tmp[64];
++	ULONGLONG keyword;
++	int eventId;
++	int level;
++	boolean ok = TRUE;
++
++	/*
++	 * Render the complete event as XML.  The first call is expected to
++	 * fail with ERROR_INSUFFICIENT_BUFFER and tells us the required size.
++	 */
++	if (!EvtRender(NULL, hEvent, EvtRenderEventXml, 0, NULL,
++				   &bufferUsed, NULL)) {
++		if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
++			Log(LOG_WARNING|LOG_SYS, "EvtRender(EventXml) failed");
++			return NULL;
++		}
++		bufferSize = bufferUsed;
++	}
++
++	if (bufferSize == 0)
++		return NULL;
++
++	xml = (WCHAR *)malloc(bufferSize);
++	if (xml == NULL)
++		return NULL;
++
++	if (!EvtRender(NULL, hEvent, EvtRenderEventXml, bufferSize, xml,
++				   &bufferUsed, NULL)) {
++		free(xml);
++		Log(LOG_WARNING|LOG_SYS, "EvtRender(EventXml) failed");
++		return NULL;
++	}
++
++	timestamp = WinEventTimeToISO8601(eventInfo[1].FileTimeVal);
++	channel = (eventInfo[5].Type == EvtVarTypeNull) ? L"" : eventInfo[5].StringVal;
++	computer = (eventInfo[6].Type == EvtVarTypeNull) ? L"" : eventInfo[6].StringVal;
++	keyword = (eventInfo[4].Type == EvtVarTypeNull) ? 0 : eventInfo[4].UInt64Val;
++	eventId = (int)eventInfo[2].UInt16Val;
++	level = (eventInfo[3].Type == EvtVarTypeNull) ? 0 : (int)eventInfo[3].ByteVal;
++
++	ok = JsonAppend(&json, &length, &capacity, L"{\"timestamp\":");
++	if (ok) ok = JsonAppendEscapedXml(&json, &length, &capacity,
++		timestamp ? timestamp : L"");
++	if (ok) ok = JsonAppend(&json, &length, &capacity, L",\"computer\":");
++	if (ok) ok = JsonAppendEscapedXml(&json, &length, &capacity, computer);
++	if (ok) ok = JsonAppend(&json, &length, &capacity, L",\"channel\":");
++	if (ok) ok = JsonAppendEscapedXml(&json, &length, &capacity, channel);
++	if (ok) ok = JsonAppend(&json, &length, &capacity, L",\"provider\":");
++	if (ok) ok = JsonAppendEscapedXml(&json, &length, &capacity, provider);
++	if (ok) ok = JsonAppend(&json, &length, &capacity, L",\"event_id\":");
++	if (ok) ok = JsonAppendInt(&json, &length, &capacity, eventId);
++	if (ok) ok = JsonAppend(&json, &length, &capacity, L",\"level\":");
++	if (ok) ok = JsonAppendInt(&json, &length, &capacity, level);
++	if (ok) ok = JsonAppend(&json, &length, &capacity, L",\"keywords\":\"0x");
++	_snwprintf_s(tmp, COUNT_OF(tmp), _TRUNCATE, L"%llX",
++		(unsigned long long)keyword);
++	if (ok) ok = JsonAppend(&json, &length, &capacity, tmp);
++	if (ok) ok = JsonAppend(&json, &length, &capacity, L"\",\"data\":{");
++	if (ok) ok = JsonAppendEventData(&json, &length, &capacity, xml);
++	if (ok) ok = JsonAppend(&json, &length, &capacity, L"}}");
++
++	free(xml);
++
++	if (!ok) {
++		if (json) free(json);
++		return NULL;
++	}
++
++	return json;
++}
++
+ /* Get specific values from an event */
+ PEVT_VARIANT GetEventInfo(EVT_HANDLE hEvent)
+ {
+@@ -182,7 +434,9 @@ PEVT_VARIANT GetEventInfo(EVT_HANDLE hEvent)
+ 	LPWSTR ppValues[] = {L"Event/System/Provider/@Name",
+ 						 L"Event/System/TimeCreated/@SystemTime",
+ 						 L"Event/System/EventID",
+ 						 L"Event/System/Level",
+-						 L"Event/System/Keywords" };
++						 L"Event/System/Keywords",
++						 L"Event/System/Channel",
++						 L"Event/System/Computer" };
+@@ -283,6 +537,7 @@ DWORD ProcessEvent(EVT_HANDLE hEvent, PVOID context)
+ 	WCHAR * formatted_string = NULL;
+ 	WCHAR * tstamp = NULL;
+ 	WCHAR * index = NULL;
++	WCHAR * eventJson = NULL;
+ 	WCHAR defmsg[ERRMSG_SZ];
+ 	WCHAR tstamped_message[SYSLOG_DEF_SZ];
+@@ -309,6 +564,16 @@ DWORD ProcessEvent(EVT_HANDLE hEvent, PVOID context)
+ 	if ((tstamp = WinEventTimeToString(eventTime)) == NULL)
+ 		tstamp = L"TIME_ERROR";
+
++	/*
++	 * JSON mode: keep the original filtering and severity calculation,
++	 * but replace the human-readable event message with structured JSON.
++	 */
++	eventJson = BuildEventJson(hEvent, eventInfo, pwszPublisherName);
++	if (eventJson == NULL) {
++		free(eventInfo);
++		if (hEvent)
++			EvtClose(hEvent);
++		return ERR_CONTINUE;
++	}
++
+ 	/* Add hostname for RFC compliance (RFC 3164) */
+@@ -474,8 +739,12 @@ DWORD ProcessEvent(EVT_HANDLE hEvent, PVOID context)
+ 	/* Combine the message strings */
+-	wcsncat_s(tstamped_message, COUNT_OF(tstamped_message), formatted_string, _TRUNCATE);
++	/* The JSON is the complete syslog MSG; do not append the legacy text. */
++	_snwprintf_s(tstamped_message, COUNT_OF(tstamped_message), _TRUNCATE,
++		L"%s", eventJson);
+
+ 	/* Send the event to the Syslog Server */
+@@ -484,6 +753,8 @@ DWORD ProcessEvent(EVT_HANDLE hEvent, PVOID context)
+ 		if (SyslogSendW(tstamped_message, level))
+ 			status = ERR_FAIL;
++	if (eventJson)
++		free(eventJson);
+ 	/* Cleanup memory and open handles */
+*** End Patch

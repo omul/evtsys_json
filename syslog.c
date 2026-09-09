@@ -128,42 +128,22 @@ void SyslogClose()
 // Send a message to the syslog server //
 int SyslogSend(char * message, int level)
 {
-	char error_message[SYSLOG_DEF_SZ];
 	WCHAR utf16_message[SYSLOG_DEF_SZ];
 	char utf8_message[SYSLOG_DEF_SZ];
 
-	// Write priority level //
-	_snprintf_s(error_message, sizeof(error_message), _TRUNCATE,
-		"<%d>%s",
-		level,
-		message
-	);
-
-	// convert from ansi/cp850 codepage (local system codepage) to utf8, widely used codepage on unix systems //
-	MultiByteToWideChar(CP_ACP, 0, error_message, -1, utf16_message, SYSLOG_DEF_SZ);
+	/* Convert to UTF-8. No Syslog PRI/header is added. */
+	MultiByteToWideChar(CP_ACP, 0, message, -1, utf16_message, SYSLOG_DEF_SZ);
 	WideCharToMultiByte(CP_UTF8, 0, utf16_message, -1, utf8_message, SYSLOG_DEF_SZ, NULL, NULL);
 
-	// Send result to syslog server //
 	return WSockSend(utf8_message);
 }
 
 // Send a message to the syslog server //
 int SyslogSendW(WCHAR * message, int level)
 {
-	WCHAR utf16_message[SYSLOG_DEF_SZ];
 	char utf8_message[SYSLOG_DEF_SZ];
 
-
-	// Write priority level //
-	_snwprintf_s(utf16_message, COUNT_OF(utf16_message), _TRUNCATE,
-		L"<%d>%s",
-		level,
-		message
-	);
-
-	// convert to utf8, widely used codepage on unix systems //
-	WideCharToMultiByte(CP_UTF8, 0, utf16_message, -1, utf8_message, SYSLOG_DEF_SZ, NULL, NULL);
-
-	// Send result to syslog server //
+	/* Convert to UTF-8. No Syslog PRI/header is added. */
+	WideCharToMultiByte(CP_UTF8, 0, message, -1, utf8_message, SYSLOG_DEF_SZ, NULL, NULL);
 	return WSockSend(utf8_message);
 }
