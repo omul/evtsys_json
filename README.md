@@ -1,6 +1,6 @@
 ﻿# WET
 
-**Windows Eventlog Transport** is small service for transporting Window's log Event to the Vector collector in JSON format.
+**Windows Eventlog Tosser** is small service for transporting Window's log Event to the Vector collector in JSON format.
 
 This is another fork of the https://github.com/zensquare/evtsys
 The page of project here: https://www.zensquare.com/projects/EvtSys
